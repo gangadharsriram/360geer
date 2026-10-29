@@ -21,6 +21,7 @@ from utils.sh_utils import RGB2SH
 from simple_knn._C import distCUDA2
 from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
+from utils.reloc_utils import compute_relocation_cuda
 
 class GaussianModel:
 
@@ -123,10 +124,16 @@ class GaussianModel:
     def get_opacity(self):
         return self.opacity_activation(self._opacity)
     
+    @staticmethod
+    def _prod3(x):
+        # Product over the last dim (3 scales). Plain multiplies instead of Tensor.prod: on RTX 40xx (sm_89)
+        # torch 1.12/cu116 JIT-compiles the prod reduction and nvrtc rejects the arch.
+        return x[..., 0] * x[..., 1] * x[..., 2]
+
     @property
     def get_h_scaled(self):
         scale_sq = torch.square(self.scaling_activation(self._scaling))
-        h_cov_scaling = torch.sqrt(scale_sq.prod(dim=1) / (scale_sq + 1e-7).prod(dim=1))
+        h_cov_scaling = torch.sqrt(self._prod3(scale_sq) / self._prod3(scale_sq + 1e-7))
         return h_cov_scaling[..., None]
     
     @property
@@ -134,7 +141,18 @@ class GaussianModel:
         opacity = self.opacity_activation(self._opacity)
         h_scale = self.get_h_scaled
         return opacity * h_scale
-    
+
+    def h_cov_scaling_for_scale(self, scale):
+        # Same formula as get_h_scaled, but for an arbitrary (activated,
+        # world-space) scale tensor instead of self._scaling - MCMC
+        # relocation (see relocate_gs/add_new_gs below) computes a new scale
+        # before it's stored as a parameter, and needs this factor to convert
+        # a target rendered opacity back into raw parameter space for that
+        # new scale, the same way reset_opacity() does for the current scale.
+        scale_sq = torch.square(scale)
+        h_cov_scaling = torch.sqrt(self._prod3(scale_sq) / self._prod3(scale_sq + 1e-7))
+        return h_cov_scaling[..., None]
+
     @property
     def get_exposure(self):
         return self._exposure
@@ -337,6 +355,53 @@ class GaussianModel:
                 optimizable_tensors[group["name"]] = group["params"][0]
         return optimizable_tensors
 
+    def replace_tensors_to_optimizer(self, inds=None):
+        # In-place index-assign into the optimizer's tracked tensors without
+        # changing their shape - a 4th pattern alongside cat_tensors_to_optimizer
+        # (append), _prune_optimizer (boolean-mask select), and
+        # replace_tensor_to_optimizer (wholesale single-tensor replace).
+        # Needed for MCMC relocation (relocate_gs/add_new_gs below): those
+        # write new values directly into self._xyz/_opacity/etc at specific
+        # indices, then call this to zero out Adam's exp_avg/exp_avg_sq at
+        # exactly those indices (the touched Gaussians' momentum is stale/
+        # meaningless post-relocation) and re-point the optimizer's param at
+        # the updated (already in-place-modified) tensor.
+        tensors_dict = {"xyz": self._xyz,
+            "f_dc": self._features_dc,
+            "f_rest": self._features_rest,
+            "opacity": self._opacity,
+            "scaling": self._scaling,
+            "rotation": self._rotation}
+
+        optimizable_tensors = {}
+        for group in self.optimizer.param_groups:
+            assert len(group["params"]) == 1
+            tensor = tensors_dict[group["name"]]
+            stored_state = self.optimizer.state.get(group['params'][0], None)
+
+            if inds is not None:
+                stored_state["exp_avg"][inds] = 0
+                stored_state["exp_avg_sq"][inds] = 0
+            else:
+                stored_state["exp_avg"] = torch.zeros_like(tensor)
+                stored_state["exp_avg_sq"] = torch.zeros_like(tensor)
+
+            del self.optimizer.state[group['params'][0]]
+            group["params"][0] = nn.Parameter(tensor.requires_grad_(True))
+            self.optimizer.state[group['params'][0]] = stored_state
+
+            optimizable_tensors[group["name"]] = group["params"][0]
+
+        self._xyz = optimizable_tensors["xyz"]
+        self._features_dc = optimizable_tensors["f_dc"]
+        self._features_rest = optimizable_tensors["f_rest"]
+        self._opacity = optimizable_tensors["opacity"]
+        self._scaling = optimizable_tensors["scaling"]
+        self._rotation = optimizable_tensors["rotation"]
+
+        torch.cuda.empty_cache()
+        return optimizable_tensors
+
     def _prune_optimizer(self, mask):
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:
@@ -514,3 +579,126 @@ class GaussianModel:
         # already exists.
         self.xyz_gradient_accum[update_filter] += torch.norm(self._xyz.grad[update_filter,:3], dim=-1, keepdim=True)
         self.denom[update_filter] += 1
+
+    def add_densification_stats_real3d_distscaled(self, update_filter, camera_center):
+        # Same real self._xyz.grad as add_densification_stats_real3d, but each
+        # iteration's per-Gaussian gradient norm is scaled by that Gaussian's
+        # distance to the current camera before accumulating - matching
+        # 3DGRT/gsplat's GSStrategy (accumulates ||grad_position|| *
+        # distance_to_camera / 2). Rationale: with a narrow camera baseline,
+        # the same absolute camera movement produces proportionally less
+        # apparent parallax for distant content than near content, so the
+        # real gradient's magnitude alone under-signals exactly the far/
+        # ambiguous regions densification most needs to catch (confirmed by
+        # densify_stats_real3d's rejection - see arguments/__init__.py).
+        # Multiplying by distance compensates for that, the same way
+        # 3DGEER's own depth^2 factor compensates the proxy statistic - but
+        # here it's applied to the real, correctly-transformed gradient
+        # rather than a synthetic proxy that stops short of the full Wt
+        # transform. No CUDA changes needed - camera_center and self._xyz
+        # already exist; distance is a plain per-Gaussian Euclidean norm.
+        dist = torch.norm(self._xyz[update_filter] - camera_center, dim=-1, keepdim=True)
+        self.xyz_gradient_accum[update_filter] += torch.norm(self._xyz.grad[update_filter,:3], dim=-1, keepdim=True) * dist * 0.5
+        self.denom[update_filter] += 1
+
+    # --- MCMC-style densification (opt-in via --densify_mode mcmc, see
+    # train.py) - ported from 3dgs-mcmc/scene/gaussian_model.py (vendored
+    # reference implementation of "3D Gaussian Splatting as Markov Chain
+    # Monte Carlo"). Structurally identical to the reference's
+    # _sample_alives/_update_params/relocate_gs/add_new_gs, with one
+    # deliberate change throughout: every place the reference reads
+    # "opacity" (the relocation formula's input, the dead-Gaussian mask,
+    # the opacity-weighted sampling probabilities) uses get_scaled_opacity
+    # here instead of get_opacity - 360geer's rendered opacity is dimmed by
+    # a scale-dependent anti-aliasing factor (h_cov_scaling, see
+    # get_h_scaled/h_cov_scaling_for_scale above) that the vanilla-3DGS
+    # reference this was ported from has no equivalent of, so a needle-shaped
+    # Gaussian with a high raw parameter but near-zero rendered opacity must
+    # not be treated as "confident/worth cloning" or "alive". The conversion
+    # back from a target rendered opacity to the raw parameter (via
+    # h_cov_scaling_for_scale, then inverse_opacity_activation) mirrors
+    # reset_opacity()'s existing pattern above.
+
+    def _sample_alives(self, probs, num, alive_indices=None):
+        probs = probs / (probs.sum() + torch.finfo(torch.float32).eps)
+        sampled_idxs = torch.multinomial(probs, num, replacement=True)
+        if alive_indices is not None:
+            sampled_idxs = alive_indices[sampled_idxs]
+        ratio = torch.bincount(sampled_idxs).unsqueeze(-1)
+        return sampled_idxs, ratio
+
+    def _update_params(self, idxs, ratio):
+        opacity_old = self.get_scaled_opacity[idxs, 0]
+        scale_old = self.get_scaling[idxs]
+        opacity_new, scale_new = compute_relocation_cuda(
+            opacity_old=opacity_old,
+            scale_old=scale_old,
+            N=ratio[idxs, 0] + 1
+        )
+        opacity_new = torch.clamp(opacity_new.unsqueeze(-1), max=1.0 - torch.finfo(torch.float32).eps, min=0.005)
+        scale_new = scale_new.reshape(-1, 3)
+
+        # Convert the relocation formula's rendered-opacity-space result back
+        # to raw parameter space - same pattern as reset_opacity(): target
+        # opacity / h_cov_scaling(new scale), then invert the activation.
+        h_cov_scaling_new = self.h_cov_scaling_for_scale(scale_new)
+        opacity_new_param = self.inverse_opacity_activation(torch.clamp(opacity_new / h_cov_scaling_new, max=1.0 - torch.finfo(torch.float32).eps, min=1e-5))
+        new_scaling = self.scaling_inverse_activation(scale_new)
+
+        return self._xyz[idxs], self._features_dc[idxs], self._features_rest[idxs], opacity_new_param, new_scaling, self._rotation[idxs]
+
+    def relocate_gs(self, dead_mask=None):
+        if dead_mask is None or dead_mask.sum() == 0:
+            return
+
+        alive_mask = ~dead_mask
+        dead_indices = dead_mask.nonzero(as_tuple=True)[0]
+        alive_indices = alive_mask.nonzero(as_tuple=True)[0]
+
+        if alive_indices.shape[0] <= 0:
+            return
+
+        probs = self.get_scaled_opacity[alive_indices, 0]
+        reinit_idx, ratio = self._sample_alives(alive_indices=alive_indices, probs=probs, num=dead_indices.shape[0])
+
+        (
+            self._xyz[dead_indices],
+            self._features_dc[dead_indices],
+            self._features_rest[dead_indices],
+            self._opacity[dead_indices],
+            self._scaling[dead_indices],
+            self._rotation[dead_indices]
+        ) = self._update_params(reinit_idx, ratio=ratio)
+
+        self._opacity[reinit_idx] = self._opacity[dead_indices]
+        self._scaling[reinit_idx] = self._scaling[dead_indices]
+
+        self.replace_tensors_to_optimizer(inds=reinit_idx)
+
+    def add_new_gs(self, cap_max):
+        current_num_points = self._opacity.shape[0]
+        target_num = min(cap_max, int(1.05 * current_num_points))
+        num_gs = max(0, target_num - current_num_points)
+
+        if num_gs <= 0:
+            return 0
+
+        probs = self.get_scaled_opacity.squeeze(-1)
+        add_idx, ratio = self._sample_alives(probs=probs, num=num_gs)
+
+        (
+            new_xyz,
+            new_features_dc,
+            new_features_rest,
+            new_opacity,
+            new_scaling,
+            new_rotation
+        ) = self._update_params(add_idx, ratio=ratio)
+
+        self._opacity[add_idx] = new_opacity
+        self._scaling[add_idx] = new_scaling
+
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation)
+        self.replace_tensors_to_optimizer(inds=add_idx)
+
+        return num_gs

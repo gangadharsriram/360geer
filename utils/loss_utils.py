@@ -13,9 +13,38 @@ import torch
 import torch.nn.functional as F
 from torch.autograd import Variable
 from math import exp
+from utils.general_utils import build_rotation
 
 def l1_loss(network_output, gt):
     return torch.abs((network_output - gt)).mean()
+
+def ray_elongation_loss(means, scales, rotations, cam_center, max_ratio=3.0):
+    # Penalizes each Gaussian's elongation specifically ALONG its own
+    # camera-ray direction - the one axis narrow-baseline capture leaves
+    # genuinely unconstrained (see the 360geer densification investigation:
+    # under weak parallax, the optimizer's cheapest way to explain an
+    # ambiguous-depth pixel is to stretch a Gaussian along the ray so it
+    # looks right from every training camera at once, then falls apart from
+    # a held-out angle). Unlike lambda_aniso (arguments/__init__.py, penalizes
+    # max/min scale ratio regardless of orientation), this only fires on
+    # elongation aligned with the ray - a genuinely thin sideways structure
+    # (a wire, a flat surface edge-on to the camera) has its long axis
+    # perpendicular to the ray, not along it, so it's untouched.
+    #
+    # cam_center is a single fixed point (the training-camera centroid, see
+    # train.py) rather than the per-iteration viewpoint - a deliberate
+    # simplification valid specifically because this investigation's
+    # problem scenes have near-co-located cameras (a few cm of baseline
+    # total, see the camera-baseline survey); for a wide-baseline capture
+    # this approximation would need revisiting to use the actual per-view
+    # camera position instead.
+    R = build_rotation(rotations)                       # (N,3,3)
+    Sigma = R @ torch.diag_embed(scales ** 2) @ R.transpose(1, 2)
+    v = F.normalize(means - cam_center, dim=-1)          # ray direction per Gaussian
+    var_along = torch.einsum('ni,nij,nj->n', v, Sigma, v)
+    var_perp = (Sigma.diagonal(dim1=1, dim2=2).sum(-1) - var_along) / 2
+    ratio = torch.sqrt(var_along / (var_perp + 1e-8))
+    return F.relu(ratio - max_ratio).mean()
 
 def l2_loss(network_output, gt):
     return ((network_output - gt) ** 2).mean()

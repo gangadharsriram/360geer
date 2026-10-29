@@ -1,0 +1,1 @@
+See AGENTS.md for project context. Read AGENTS.md, JOURNAL.md, .agent-log/progress_summary.md and the latest log in .agent-log/progress/MM-YYYY/ before starting work; append JOURNAL.md and update .agent-log/progress/MM-YYYY/DD-MM-YY.md before ending a session.

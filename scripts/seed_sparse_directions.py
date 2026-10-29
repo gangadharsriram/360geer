@@ -120,8 +120,8 @@ def main():
             seed_rgb.append(color)
             n_seeded += 1
 
-    seed_xyz = np.array(seed_xyz)
-    seed_rgb = np.array(seed_rgb)
+    seed_xyz = np.array(seed_xyz).reshape(-1, 3)   # reshape: zero seeds (dense cloud, full coverage) must stay (0, 3)
+    seed_rgb = np.array(seed_rgb).reshape(-1, 3)
 
     out_xyz = np.concatenate([xyz, seed_xyz], axis=0)
     out_rgb = np.concatenate([rgb, seed_rgb], axis=0)

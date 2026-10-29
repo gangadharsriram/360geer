@@ -145,6 +145,27 @@ class OptimizationParams(ParamGroup):
                                             # proxy's - densify_grad_threshold needs fresh
                                             # calibration when this is on, the existing
                                             # tuned values (e.g. 0.00006) do not carry over.
+                                            # Tested and rejected as a densification signal on
+                                            # its own (exp94-97) - too weak/noisy in exactly the
+                                            # far/ambiguous regions where densification matters
+                                            # most. See densify_stats_real3d_distscaled below,
+                                            # which compensates for that specific weakness.
+        self.densify_stats_real3d_distscaled = 0  # off by default. Set to 1 to use
+                                            # add_densification_stats_real3d_distscaled: same
+                                            # real self._xyz.grad as densify_stats_real3d above,
+                                            # but each iteration's per-Gaussian gradient norm is
+                                            # multiplied by that Gaussian's distance to the
+                                            # current camera before accumulating (matching
+                                            # 3DGRT/gsplat's GSStrategy: accumulates
+                                            # ||grad_position|| * distance_to_camera / 2). Real,
+                                            # signed gradient (not the fabsf/depth-scaled proxy),
+                                            # but compensates for the real gradient's weak signal
+                                            # at distance the same way 3DGEER's depth^2 factor
+                                            # does for the proxy - unlike plain densify_stats_real3d,
+                                            # this doesn't fall down in far/ambiguous regions.
+                                            # Own threshold calibration needed, same as
+                                            # densify_stats_real3d - values do not carry over
+                                            # from either the proxy's or plain real3d's tuning.
         self.densify_from_iter = 500
         self.densify_until_iter = 15000
         self.prune_until_iter = 15000     # was implicitly == densify_until_iter (pruning
@@ -155,14 +176,56 @@ class OptimizationParams(ParamGroup):
         self.lambda_aniso = 0.01       # weight of the soft scale-anisotropy regularizer
         self.aniso_soft_ratio = 10.0   # scale ratios (max/min axis) below this are free
         self.aniso_hard_ratio = 50.0   # densify_and_prune hard cutoff on scale ratio
+        self.lambda_ray_aniso = 0.0    # off by default. Weight of the ray-aligned elongation
+                                        # penalty (utils/loss_utils.py's ray_elongation_loss) -
+                                        # unlike lambda_aniso above (any max/min scale ratio,
+                                        # regardless of orientation), this only fires on
+                                        # elongation aligned with each Gaussian's own camera
+                                        # ray - the specific axis narrow-baseline capture
+                                        # leaves unconstrained, and the direction the needle-
+                                        # shaped scattered-artifact Gaussians actually stretch
+                                        # along. Does not flatten legitimate thin structures
+                                        # lying sideways to the camera (wires, edges).
+        self.ray_aniso_max_ratio = 3.0 # elongation along-ray vs perpendicular ratio above
+                                        # which the penalty kicks in (hinge, like aniso_soft_ratio)
         self.lambda_opacity_sparsity = 0.0  # off by default - see train.py loss section
+        self.row_weight_bottom_frac = 0.0  # off by default. Fraction of image rows at the bottom (equirect nadir) whose L1/SSIM loss weight is row_weight_value
+        self.row_weight_value = 1.0        # weight applied to those rows (others 1.0); weighted mean, so the loss scale is unchanged
+        self.lambda_vgg = 0.0          # off by default. Weight of the VGG16 perceptual loss (utils/vgg_loss.py)
+        self.vgg_start_iter = 0        # VGG loss only applies from this iteration on (e.g. 15000 = after densification ends)
+        self.vgg_crop = 512            # VGG loss is computed on one random crop x crop patch per step (0 = full image)
+        self.lambda_scale_reg = 0.0    # off by default. Weight on mean(|Gaussian scale|) (world units) in the normal densify mode, see train.py
         self.lambda_smooth = 0.0       # off by default - edge-aware image smoothness, see train.py
         self.smooth_edge_scale = 10.0  # GT-gradient sensitivity for the edge-aware weighting above
                                         # (standard MonoDepth2 default) - higher means edges need to
                                         # be sharper in GT before smoothness backs off there
+        self.smooth_prior_dir = ""     # off by default (""). If set, the edge-aware weighting
+                                        # above uses precomputed illumination-invariant structure
+                                        # maps (Structure Prior Extraction/, CIConv 'W') from this
+                                        # dir instead of the raw GT gradient - see train.py.
         self.depth_l1_weight_init = 0.1
         self.depth_l1_weight_final = 0.01
         self.random_background = False
+        self.densify_mode = "grad_threshold"  # "grad_threshold" (default, current
+                                               # behavior unchanged, everything above) or
+                                               # "mcmc" (3DGS-MCMC-style relocation/growth,
+                                               # see gaussian_model.py's relocate_gs/
+                                               # add_new_gs - replaces the whole
+                                               # densify_and_prune call in train.py, does
+                                               # not stack with it).
+        self.cap_max = -1              # required when densify_mode=mcmc: target max
+                                        # Gaussian count grown toward via add_new_gs.
+                                        # No effect in grad_threshold mode.
+        self.mcmc_noise_lr = 5e5       # mcmc mode only: scale of the per-iteration,
+                                        # covariance-shaped, opacity-gated position noise
+                                        # (3DGS-MCMC's SGLD exploration term)
+        self.mcmc_opacity_reg = 0.01   # mcmc mode only: weight on mean(|rendered opacity|)
+                                        # - separate knob from lambda_opacity_sparsity
+                                        # above (that one stays tuned to 0.012 on raw
+                                        # get_opacity for grad_threshold mode; this one
+                                        # targets get_scaled_opacity, only applied in
+                                        # mcmc mode)
+        self.mcmc_scale_reg = 0.01     # mcmc mode only: weight on mean(|scale|)
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):
